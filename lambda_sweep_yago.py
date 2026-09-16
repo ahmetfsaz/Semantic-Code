@@ -1,138 +1,123 @@
-import sys
-import os
+"""
+Effect of the inductive prior coefficient on relation entropy in YAGO3-10.
+
+Builds Huffman codebooks over the relation vocabulary of YAGO3-10 two ways: at
+the symbol level, where each relation is coded under its inductive probability,
+and at the character level, where the concatenated relation names are coded by
+character frequency. Reports the average codeword length and entropy of each.
+
+It then sweeps the prior coefficient lambda across thirty-one powers of two,
+showing how shifting weight from the empirical counts toward the prior flattens
+the induced distribution and raises its entropy.
+"""
+
 from collections import Counter
+
 import huffman
-from scipy.stats import entropy
 import numpy as np
+from scipy.stats import entropy
 
-# Define the lambda function
+# ── Configuration ────────────────────────────────────────────────────────────
+INPUT_PATH = "YAGO3-10.txt"
+LAMBDA_MIN_EXPONENT = 0.0
+LAMBDA_MAX_EXPONENT = 30.0
+LAMBDA_STEPS = 31
+
+
 def lambda_w(w):
-    # Placeholder for the actual implementation of lambda(w)
-    # This should be replaced with the actual function definition.
-    return w  # This is just a placeholder, replace with the actual function
-
-# Define the main function that uses lambda_w
-def calculate_probability(nj, n, w1, w2):
-    return (nj + 2 * lambda_w(w1) / w2) / (n + lambda_w(w1))
+    """Prior coefficient as a function of the category weight."""
+    return w
 
 
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    with open('dataset_exp1/facts_0.txt') as file:
-        data = file.readlines()
+def calculate_probability(count, total, w1, w2):
+    """Inductive probability of a symbol observed `count` times in `total` draws.
 
-    # Print first 10 lines of YAGO3
-
-    count = 0
-    for line in data:
-        s, r, o = line.split('\t')
-        print(s, ' ', r, ' ', o)
-        count += 1
-        if count == 10:
-            break
+    `w1` scales the prior coefficient and `w2` is the number of categories the
+    prior pseudo-count is spread across, so larger `w1` pulls the estimate away
+    from the empirical frequency and toward a uniform distribution.
+    """
+    return (count + 2 * lambda_w(w1) / w2) / (total + lambda_w(w1))
 
 
-    file_path = 'YAGO3-10.txt'
+def load_counts(path):
+    """Read whitespace-separated triples in a single pass.
 
-    # Initialize sets to store unique subjects, relations, and objects.
-    unique_subjects = set()
-    unique_relations = set()
-    unique_objects = set()
+    Returns counters for subjects, relations and objects, the relation names
+    concatenated into one string for character-level coding, and the number of
+    triples read.
+    """
+    subjects, relations, objects = Counter(), Counter(), Counter()
+    relation_text = []
+    num_triples = 0
 
-    rels = []
-    # Read the file and process each line. Append relations in a separate file.
-    with open(file_path, 'r') as file:
-        for line in file:
-            # Splitting each line into subject, relation, object
+    with open(path) as handle:
+        for line in handle:
             parts = line.strip().split()
-            if len(parts) == 3:
-                subject, relation, object = parts
-                rels.append(relation)
-                rels.append(' ')
-                unique_subjects.add(subject)
-                unique_relations.add(relation)
-                unique_objects.add(object)
-    rels = ''.join(rels)
+            if len(parts) != 3:
+                continue
+            subject, relation, obj = parts
+            subjects[subject] += 1
+            relations[relation] += 1
+            objects[obj] += 1
+            relation_text.append(relation)
+            relation_text.append(" ")
+            num_triples += 1
 
-    # Counting the number of unique elements in each category
-    num_unique_subjects = len(unique_subjects)
-    num_unique_relations = len(unique_relations)
-    num_unique_objects = len(unique_objects)
-
-    print('Num Subjects: ', num_unique_subjects, '  ', 'Num Relations: ',  num_unique_relations, '  ', 'Num Objects: ', num_unique_objects)
+    return subjects, relations, objects, "".join(relation_text), num_triples
 
 
-    # Initialize counters for subjects, relations, and objects.
-    subject_counter = Counter()
-    relation_counter = Counter()
-    object_counter = Counter()
-
-    num_samples_YAGO = 0
-    # Read the file and count occurrences of each subject, relation, and object.
-    with open(file_path, 'r') as file:
-        for line in file:
-            parts = line.strip().split()
-            if len(parts) == 3:
-                num_samples_YAGO += 1
-                subject, relation, object = parts
-                subject_counter[subject] += 1
-                relation_counter[relation] += 1
-                object_counter[object] += 1
+def huffman_average_length(counts, probabilities):
+    """Average codeword length of a Huffman code under a given distribution."""
+    codebook = huffman.codebook(sorted(counts.items()))
+    return sum(len(codebook[symbol]) * probabilities[symbol] for symbol in counts)
 
 
-    print(relation_counter)
+def main():
+    subjects, relations, objects, relation_text, num_triples = load_counts(INPUT_PATH)
 
-    # Example usage:
-    # This is just an example with placeholder values since the actual lambda(w) is not defined.
-    result_prob_our = []
+    print(f"Read {num_triples} triples from {INPUT_PATH}")
+    print(
+        f"Unique subjects: {len(subjects)}  "
+        f"relations: {len(relations)}  "
+        f"objects: {len(objects)}"
+    )
 
-    counter_items = sorted(list(relation_counter.items()))
-    for i in range(len(counter_items)):
-        result_prob_our.append(calculate_probability(counter_items[i][1], num_samples_YAGO, 1, 1))
+    # Symbol-level coding: each relation coded under its inductive probability.
+    inductive = {
+        relation: calculate_probability(count, num_triples, w1=1, w2=1)
+        for relation, count in relations.items()
+    }
+    print(f"\nSymbol level — average codeword length: "
+          f"{huffman_average_length(relations, inductive):.4f} bits")
+    print(f"Symbol level — entropy: "
+          f"{entropy(list(inductive.values()), base=2):.4f} bits")
+
+    # Character-level coding: the concatenated relation names by character.
+    char_counts = Counter(relation_text)
+    char_probabilities = {
+        char: count / len(relation_text) for char, count in char_counts.items()
+    }
+    print(f"\nCharacter level — {len(relation_text)} characters, "
+          f"{len(char_counts)} distinct")
+    print(f"Character level — average codeword length: "
+          f"{huffman_average_length(char_counts, char_probabilities):.4f} bits")
+    print(f"Character level — entropy: "
+          f"{entropy(list(char_probabilities.values()), base=2):.4f} bits")
+
+    # Sweep the prior coefficient. The pseudo-count is spread across the
+    # relation vocabulary, so w2 is the number of distinct relations.
+    print("\nLambda sweep over the relation distribution:")
+    lambdas = np.logspace(
+        LAMBDA_MIN_EXPONENT, LAMBDA_MAX_EXPONENT, num=LAMBDA_STEPS, base=2.0
+    )
+    for lam in lambdas:
+        probabilities = [
+            calculate_probability(count, num_triples, w1=lam, w2=len(relations))
+            for count in relations.values()
+        ]
+        print(f"  lambda = {lam:>12.1f}   entropy = "
+              f"{entropy(probabilities, base=2):.4f} bits")
 
 
-    print('Our Probabilities: ', result_prob_our)
-
-    sorted_counter = sorted(relation_counter.items())
-    print('Sorted Counter Our: ', sorted_counter)
-    codebook = huffman.codebook(sorted_counter)
-    print('Huffman Codebook Our: ',codebook)
-
-    avg_our = 0
-    codb_our= []
-    for item in codebook.items():
-        codb_our.append(len(item[1]))
-    for i in range(len(codb_our)):
-        avg_our += codb_our[i]*result_prob_our[i]
-    print('AVG CW LENGTH OUR', avg_our)
-    print('ENTROPY OUR', entropy(result_prob_our, base=2))
-
-    # Compute for Shannon
-    sorted_shannon = sorted(Counter(rels).items())
-    codebook2 = huffman.codebook(sorted_shannon)
-    print('Sorted Counter Shannon: ', sorted_shannon)
-    print('Huffman Codebook Shannon: ', codebook2)
-    print('Number of Elements Shannon: ', len(rels))
-
-    avg_shn = 0
-    codb_shn = []
-    for item in codebook2.items():
-        codb_shn.append(len(item[1]))
-    probs_shn = []
-    for i in range(len(codb_shn)):
-        avg_shn += codb_shn[i] * (sorted_shannon[i][1]/len(rels))
-        probs_shn.append(sorted_shannon[i][1]/len(rels))
-    print('AVG CW LENGTH SHN', avg_shn)
-    print('ENTROPY SHN', entropy(probs_shn, base=2))
-
-    #Experiment with various values of lambda
-
-    lambdas = np.logspace(0.0, 30.0, num=31, base=2.0)
-    print('Lambdas:', lambdas)
-
-    for j in range(len(lambdas)):
-        result_prob_lamb = []
-        counter_items = sorted(list(relation_counter.items()))
-        for i in range(len(counter_items)):
-            result_prob_lamb.append(calculate_probability(counter_items[i][1], num_samples_YAGO, lambdas[j], 37))
-        print('Lambda = ', lambdas[j], ' ENTROPY: ', entropy(result_prob_lamb, base=2))
+if __name__ == "__main__":
+    main()
