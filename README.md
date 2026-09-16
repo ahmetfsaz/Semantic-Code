@@ -15,9 +15,9 @@ a message narrows down the true state of the world, calibrated by language granu
 content-informativeness is comparable across systems built on different ontologies.
 
 This repository contains the source-coding experiments. Each story is treated as an independent
-semantic source. For each one the scripts compute its calibrated content-entropy, compress it
-both semantically and with a conventional entropy coder, and trace the trade-off between
-transmission rate and retained logical content.
+semantic source. For each one the scripts compute its content-entropy, compress it both
+semantically and with a conventional entropy coder, and trace the trade-off between transmission
+rate and retained logical content.
 
 ## Repository structure
 
@@ -63,46 +63,64 @@ entities and 37 relations; download it and place `YAGO3-10.txt` in the repositor
 pip install numpy scipy matplotlib huffman pandas torch transformers
 ```
 
-`torch` and `transformers` are needed only for the BART baseline.
+`torch`, `transformers` and `pandas` are needed only for the BART baseline.
 
 ## Running
 
 Each script runs standalone with no arguments:
 
 ```bash
-python3 semantic_compression.py          # content-entropy, compression ratios, rate–distortion plot
+python3 semantic_compression.py          # content-entropy, compression, rate–distortion plot
 python3 content_entropy_min_norm.py      # same pipeline, min-normalized measure
 python3 lambda_sweep_yago.py             # λ sweep over YAGO3-10 (requires YAGO3-10.txt)
 python3 bart_baseline.py                 # BART autoencoder (GPU recommended)
+python3 dataset_partition.py             # overlapping partitions (requires YAGO3-10.txt)
 ```
 
-Parameters are set inside the scripts rather than on the command line.
+Parameters are not passed on the command line. Each script opens with a `Configuration` block
+of module-level constants — input paths, budgets, sweep ranges — which is the only place that
+needs editing to change a run.
+
+## Outputs
+
+| Script | Produces |
+| --- | --- |
+| `semantic_compression.py` | Per-story codeword lengths, bit totals and entropies on stdout; rate curves saved to `plot.eps` |
+| `content_entropy_min_norm.py` | Per-story bit totals and min-normalized content-entropy on stdout |
+| `lambda_sweep_yago.py` | Symbol- and character-level coding costs, then entropy at each λ, on stdout |
+| `bart_baseline.py` | Trained weights, saved to a filename recording the hyperparameters used |
+| `dataset_partition.py` | One tab-separated file per node under `partitions/` |
+
+`semantic_compression.py` also runs a per-story λ sweep, which is verbose; set
+`RUN_LAMBDA_SWEEP = False` to skip it, since `lambda_sweep_yago.py` covers the same ground at
+knowledge-graph scale.
 
 ## What each script computes
 
 ### `semantic_compression.py`
 
-The main experiment. For each of the seven stories it computes the calibrated content-entropy
-and its normalized efficiency, then compares two compression paths: a conventional Huffman code
-over the narrative, and a semantic pipeline that reduces the text to first-order logic and
-entropy-codes it using inductive probabilities. It then sweeps the rate constraint to trace
-normalized mutual content-information against bit cost.
+The main experiment. For each of the seven stories it computes the calibrated content-entropy,
+then compares two compression paths: a conventional Huffman code over the narrative, and a
+semantic pipeline that codes the subject, relation and object of every ground fact under
+inductive probabilities. It traces the cumulative cost of sending facts cheapest-first against
+the share of content delivered, and reports the content-entropies normalized by the largest.
 
 Content-entropy spans thousands of orders of magnitude, so it is evaluated with `Decimal`
-arithmetic and reported under several normalizations.
+arithmetic at high precision.
 
 ### `content_entropy_min_norm.py`
 
-The same pipeline under the min-normalized content measure, producing the corresponding column
-of the reported results. It shares most of its body with `semantic_compression.py` and differs
-only in which normalization it applies.
+The same pipeline under the min-normalized content measure. Under that normalization the
+subject, relation and object counts cancel and the measure depends only on the number of ground
+facts, so stories with equal fact counts share a value.
 
 ### `lambda_sweep_yago.py`
 
-Works at knowledge-graph rather than story scale. It builds Huffman and Shannon codebooks over
-YAGO3-10 relation frequencies and reports average codeword length and entropy, then sweeps the
-inductive prior coefficient λ from 2⁰ to 2³⁰ to show how the weight placed on the prior against
-empirical counts shifts the resulting entropy.
+Works at knowledge-graph rather than story scale. It builds Huffman codebooks over the YAGO3-10
+relation vocabulary two ways — at the symbol level under inductive probabilities, and at the
+character level over the concatenated relation names — and reports the average codeword length
+and entropy of each. It then sweeps the inductive prior coefficient λ from 2⁰ to 2³⁰ to show how
+shifting weight from the empirical counts toward the prior flattens the induced distribution.
 
 ### `bart_baseline.py`
 
@@ -112,8 +130,9 @@ but gives no account of which logical content survives the bottleneck.
 
 ### `dataset_partition.py`
 
-Splits knowledge graph edges across a given number of partitions with controlled overlap,
-producing the partial, overlapping views used in distributed settings.
+Splits knowledge graph triples across a set of nodes and gives each node a fraction of another
+node's triples, so their views overlap. This produces the partial, overlapping perspectives used
+in the distributed setting, where no single node observes the whole graph.
 
 ## Citation
 
