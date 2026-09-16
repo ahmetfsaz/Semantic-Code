@@ -1,104 +1,162 @@
-import sys
-import os
+"""
+BART autoencoder baseline for semantic compression of first-order logic premises.
+
+Passes the FOL premises of the FOLIO dataset through a linear bottleneck placed
+between a BART encoder and decoder, then reconstructs them. This is the learned
+compression baseline the semantic framework is compared against: it compresses
+effectively but gives no account of which logical content survives the bottleneck.
+"""
+
+import random
+
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, TensorDataset
-from transformers import AutoTokenizer, BartForConditionalGeneration, BartTokenizer
-import numpy as np
-import random
+from transformers import BartForConditionalGeneration, BartTokenizer
 
-np.random.seed(2024)
-torch.manual_seed(2024)
-random.seed(2024)
+# ── Configuration ────────────────────────────────────────────────────────────
+DATA_PATH = "folio-train.jsonl"
+MODEL_NAME = "facebook/bart-large"
 
-# Read the JSONL file into a DataFrame
-file_path = 'folio-train.jsonl'
-df = pd.read_json(file_path, lines=True)
+BOTTLENECK_SIZE = 8
+MAX_LENGTH = 613
+BATCH_SIZE = 3          # 16 exhausts GPU memory at this sequence length
+LEARNING_RATE = 1e-5
+NUM_EPOCHS = 50
+SEED = 2024
 
-# Extract the desired columns into different variables
-conclusions = df['conclusion'].tolist()
-premises = df['premises'].tolist()
-premises_FOL = df['premises-FOL'].tolist()
-labels = df['label'].tolist()
+CHECKPOINT_PATH = (
+    f"bart_ae_ep{NUM_EPOCHS}_lr{LEARNING_RATE:g}_bs{BATCH_SIZE}"
+    f"_bottleneck{BOTTLENECK_SIZE}_maxlen{MAX_LENGTH}.pth"
+)
 
-# Check if a GPU is available and set the device accordingly
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
 
 class BartAutoencoder(torch.nn.Module):
-    def __init__(self, model_name="facebook/bart-large", bottleneck_size=5):
-        super(BartAutoencoder, self).__init__()
-        self.encoder = BartForConditionalGeneration.from_pretrained(model_name).to(device)
-        self.bottleneck1 = torch.nn.Linear(self.encoder.config.d_model, bottleneck_size).to(device)
-        self.bottleneck2 = torch.nn.Linear(bottleneck_size, self.encoder.config.d_model).to(device)
-        self.decoder = BartForConditionalGeneration.from_pretrained(model_name).to(device)
+    """BART encoder and decoder joined by a linear bottleneck.
+
+    The encoder's hidden states are projected down to `bottleneck_size`
+    dimensions and back up to the model dimension before decoding, so the
+    bottleneck width sets how much information can cross between the two.
+    """
+
+    def __init__(self, model_name=MODEL_NAME, bottleneck_size=BOTTLENECK_SIZE):
+        super().__init__()
+        self.encoder = BartForConditionalGeneration.from_pretrained(model_name)
+        self.decoder = BartForConditionalGeneration.from_pretrained(model_name)
+        d_model = self.encoder.config.d_model
+        self.bottleneck_down = torch.nn.Linear(d_model, bottleneck_size)
+        self.bottleneck_up = torch.nn.Linear(bottleneck_size, d_model)
 
     def forward(self, input_ids, attention_mask=None, decoder_input_ids=None):
-        encoder_outputs = self.encoder.model.encoder(input_ids=input_ids.to(device), attention_mask=attention_mask.to(device))
-        compressed = self.bottleneck1(encoder_outputs.last_hidden_state)
-        decompressed = self.bottleneck2(compressed)
-        decoder_outputs = self.decoder(inputs_embeds=decompressed, decoder_input_ids=decoder_input_ids.to(device))
+        encoder_outputs = self.encoder.model.encoder(
+            input_ids=input_ids, attention_mask=attention_mask
+        )
+        compressed = self.bottleneck_down(encoder_outputs.last_hidden_state)
+        decompressed = self.bottleneck_up(compressed)
+        decoder_outputs = self.decoder(
+            inputs_embeds=decompressed, decoder_input_ids=decoder_input_ids
+        )
         return decoder_outputs.logits
 
 
-# Example usage
-model_name = "facebook/bart-large"
-autoencoder = BartAutoencoder(model_name=model_name, bottleneck_size=8)
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-# Concatenate the FOL sentences into a single string for each example
-premises_FOL_concatenated = [', '.join(sentences) for sentences in premises_FOL]
 
-# Tokenize input sentences
-tokenizer = BartTokenizer.from_pretrained(model_name)
-inputs = tokenizer(premises_FOL_concatenated, return_tensors="pt", padding="max_length", truncation=True, max_length=613)
-decoder_input_ids = inputs.input_ids.clone()
+def load_premises(path):
+    """Return each example's FOL premises joined into a single string.
 
-# Move tensors to the same device as the model
-inputs = inputs.to(device)
-decoder_input_ids = decoder_input_ids.to(device)
+    The FOLIO records also carry `conclusion`, `premises` and `label`; only the
+    FOL premises are used here, since the baseline reconstructs logical form.
+    """
+    df = pd.read_json(path, lines=True)
+    return [", ".join(sentences) for sentences in df["premises-FOL"]]
 
-# Forward pass
-outputs = autoencoder(inputs.input_ids[:1], attention_mask=inputs.attention_mask[:1], decoder_input_ids=decoder_input_ids[:1])
 
-# Create a TensorDataset and DataLoader
-dataset = TensorDataset(inputs.input_ids, inputs.attention_mask, decoder_input_ids)
-dataloader = DataLoader(dataset, batch_size=3, shuffle=False)
-#dataloader = DataLoader(dataset, batch_size=16, shuffle=True) # OUT OF MEMORY
+def build_dataloader(premises, tokenizer):
+    """Tokenize the premises and wrap them in a DataLoader.
 
-# Define the model, loss function, and optimizer0 nb
-loss_fn = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(autoencoder.parameters(), lr=1e-5)
+    Tensors stay on CPU; batches are moved to the device individually, which
+    keeps the full tokenized corpus out of GPU memory.
+    """
+    inputs = tokenizer(
+        premises,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=MAX_LENGTH,
+    )
+    decoder_input_ids = inputs.input_ids.clone()
+    dataset = TensorDataset(inputs.input_ids, inputs.attention_mask, decoder_input_ids)
+    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-# Training loop
-num_epochs = 50
-autoencoder.train()
-sentences = []
 
-for epoch in range(num_epochs):
-    sentences = []
-    count = 0
-    for batch in dataloader:
-        input_ids, attention_mask, labels = [tensor.to(device) for tensor in batch]
+def train(model, dataloader, tokenizer, device):
+    loss_fn = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    model.train()
 
-        # Forward pass
-        outputs = autoencoder(input_ids, attention_mask=attention_mask, decoder_input_ids=labels)
-        logits = outputs[:, :-1].contiguous().view(-1, outputs.size(-1))
-        labels = labels[:, 1:].contiguous().view(-1)
+    for epoch in range(NUM_EPOCHS):
+        epoch_loss = 0.0
+        sample_reconstruction = None
 
-        # Compute loss and backpropagate
-        loss = loss_fn(logits, labels)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        for step, batch in enumerate(dataloader):
+            input_ids, attention_mask, decoder_input_ids = [
+                tensor.to(device) for tensor in batch
+            ]
 
-        predictions = torch.argmax(outputs, dim=-1)  # Get the predicted token IDs
-        decoded_predictions = [tokenizer.decode(pred, skip_special_tokens=True) for pred in predictions]
-        sentences.append(decoded_predictions)
+            logits = model(
+                input_ids,
+                attention_mask=attention_mask,
+                decoder_input_ids=decoder_input_ids,
+            )
 
-        print("Epoch: ", epoch, " Count: ", count)
-        count = count + 1
+            # Shift so that position t predicts token t+1.
+            shifted_logits = logits[:, :-1].contiguous().view(-1, logits.size(-1))
+            targets = decoder_input_ids[:, 1:].contiguous().view(-1)
 
-    print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item()}")
-    print(sentences[0])
+            loss = loss_fn(shifted_logits, targets)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-torch.save(autoencoder, "New_model_50ep_lr_5eminus5_batchsize_3_bottleneck_32+_max_length_613.pth")
+            epoch_loss += loss.item()
+
+            # Decode the first batch only, as a readable progress check.
+            if step == 0:
+                predictions = torch.argmax(logits, dim=-1)
+                sample_reconstruction = [
+                    tokenizer.decode(pred, skip_special_tokens=True)
+                    for pred in predictions
+                ]
+
+        mean_loss = epoch_loss / len(dataloader)
+        print(f"Epoch {epoch + 1}/{NUM_EPOCHS}  mean loss: {mean_loss:.4f}")
+        if sample_reconstruction:
+            print(f"  sample: {sample_reconstruction[0]}")
+
+
+def main():
+    set_seed(SEED)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    premises = load_premises(DATA_PATH)
+    print(f"Loaded {len(premises)} examples from {DATA_PATH}")
+
+    tokenizer = BartTokenizer.from_pretrained(MODEL_NAME)
+    dataloader = build_dataloader(premises, tokenizer)
+
+    model = BartAutoencoder().to(device)
+    train(model, dataloader, tokenizer, device)
+
+    torch.save(model.state_dict(), CHECKPOINT_PATH)
+    print(f"Saved weights to {CHECKPOINT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
